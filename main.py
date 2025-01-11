@@ -2,46 +2,50 @@ import os
 import json
 import openai
 import requests
+import pytest
+from datetime import datetime
 
 ################################################################################
 # 1) Setup:
-#    - Make sure you install openai and requests (e.g., pip install openai requests).
-#    - Set environment variable OPENAI_API_KEY with your OpenAI key.
-#    - Replace <your_perplexity_token> and <your_firecrawl_token> below with your
-#      actual tokens.
+#    - Make sure to install openai and requests packages (e.g., pip install openai requests).
+#    - Set the environment variable OPENAI_API_KEY with your OpenAI key.
+#    - Tokens for other APIs should be retrieved from environment variables for security.
 ################################################################################
 
-# For illustration only; in a production system, store tokens securely (e.g., environment variables or vault).
-PERPLEXITY_API_TOKEN = os.getenv("PERPLEXITY_API_TOKEN", "...")
-FIRECRAWL_API_TOKEN = os.getenv("FIRECRAWL_API_TOKEN", "...")
+# For demonstration purposes only; in production, securely store tokens using environment variables or a vault.
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "...")
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "...")
 openai.api_key = os.getenv("OPENAI_API_KEY", "...")
 
 ################################################################################
-# 2) Define Python functions that call external APIs
+# 2) Define Python functions to interface with external APIs
 #
-#    These will be exposed (via function calling) to the main ChatCompletion call,
-#    so the model can decide if it wants to invoke them to gather data.
+#    These functions are available for the main ChatCompletion call, allowing
+#    the model to choose to invoke them to obtain data.
 ################################################################################
 
-def call_perplexity(query: str) -> str:
+def get_current_datetime() -> str:
+    """Returns the current date and time formatted for display."""
+    now = datetime.now()
+    formatted_time = now.strftime("%A, %B %d, %Y, %H:%M:%S")
+    return f"Current date and time: {formatted_time}"
+
+def call_research_assistant(query: str) -> str:
     """
-    Calls the Perplexity AI API with the given query.
-    Returns the text content from the model’s answer.
+    Uses the Perplexity AI API to perform a research query.
+    Returns the text response from the model's answer.
     """
     url = "https://api.perplexity.ai/chat/completions"
     payload = {
-        "model": "llama-3.1-sonar-small-128k-online",
-        "messages": [
-            {"role": "system", "content": "Be precise and concise."},
-            {"role": "user", "content": query},
-        ],
-        "temperature": 0.2,
+        "model": "llama-3.1-sonar-large-128k-online",
+        "messages": [{"role": "user", "content": query}],
+        "temperature": 0.7,
         "top_p": 0.9,
         "search_recency_filter": "month",
         "stream": False,
     }
     headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_TOKEN}",
+        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json",
     }
     try:
@@ -52,11 +56,10 @@ def call_perplexity(query: str) -> str:
     except Exception as e:
         return f"Error calling Perplexity API: {str(e)}"
 
-
-def call_firecrawl_scrape(url: str, wait_for: int = 0) -> str:
+def call_web_search_assistant(url: str, wait_for: int = 0) -> str:
     """
-    Calls Firecrawl's /v1/scrape endpoint to scrape a single URL.
-    Returns the resulting markdown content if successful.
+    Uses Firecrawl API to scrape the content from a given URL.
+    Returns the content as markdown if successful.
     """
     endpoint = "https://api.firecrawl.dev/v1/scrape"
     payload = {
@@ -68,10 +71,9 @@ def call_firecrawl_scrape(url: str, wait_for: int = 0) -> str:
         "removeBase64Images": True,
     }
     headers = {
-        "Authorization": f"Bearer {FIRECRAWL_API_TOKEN}",
+        "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
         "Content-Type": "application/json",
     }
-
     try:
         response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
@@ -84,90 +86,172 @@ def call_firecrawl_scrape(url: str, wait_for: int = 0) -> str:
     except Exception as e:
         return f"Error calling Firecrawl API: {str(e)}"
 
-
-def call_firecrawl_search(query: str, limit: int = 5) -> str:
+def get_critical_feedback(question: str, assistant_content: str) -> str:
     """
-    Calls Firecrawl's /search endpoint to perform a SERP search with optional scraping.
-    Returns a JSON-string of the combined search results.
-    By default, it returns up to 5 results.
+    Provides a critical evaluation of the Q&A to identify important questions.
+    Invokes a helper to parse the content and list top 10 critical questions.
     """
-    endpoint = "https://api.firecrawl.dev/v1/search"
-    payload = {
-        "query": query,
-        "limit": limit,
-        # If you'd like to also fetch full markdown each time, you can add "scrapeOptions"
-        # with "formats": ["markdown"]. For large queries, you might want to do carefully.
-        #
-        # "scrapeOptions": {
-        #     "formats": ["markdown"],
-        #     "onlyMainContent": True,
-        #     "removeBase64Images": True
-        # },
-    }
-    headers = {
-        "Authorization": f"Bearer {FIRECRAWL_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    critical_feedback = call_helper(f"""
+    Critically evaluate the following question and answer. 
+    Your task is to provide a list of the top 10 most important questions about the solution that need to be answered.
+    Respond only with one question per line.
+    
+    ``` Question
+    {question}
+    ```
 
+    ``` Answer
+    {assistant_content}
+    ```
+    """)
+    print(f"\nCritical Feedback\n\n{critical_feedback}")
+    return critical_feedback
+
+def call_research_professional(question: str, prompt: str) -> str:
+    """
+    Interfaces with OpenAI's "o1" model for advanced reasoning tasks.
+    Executes a conversation loop, analyzing when to apply function calls.
+    """
+    messages = [{"role": "user", "content": get_current_datetime() + '\n' + prompt}]
+    refactor_count = 1
+
+    for _ in range(500):
+        try:
+            response = openai.chat.completions.create(
+                model="o1",
+                messages=messages,
+                response_format={"type": "text"},
+                reasoning_effort="high",
+                tools=tools
+            )
+
+            msg = response.choices[0].message
+            print(f"Response\n")
+            print("=" * 80)
+            print(f"\n{msg}\n\n")
+
+            finish_reason = response.choices[0].finish_reason
+            tool_calls = msg.tool_calls
+            assistant_content = msg.content
+
+            if tool_calls:
+                # Processing any requested function calls
+                for tc in tool_calls:
+                    func_name = tc.function.name
+                    arguments_json = tc.function.arguments
+
+                    # Parsing function arguments
+                    try:
+                        arguments = json.loads(arguments_json)
+                    except json.JSONDecodeError:
+                        arguments = {}
+
+                    # Executing relevant function
+                    if func_name == "call_research_assistant":
+                        query = arguments.get("query", "")
+                        result = call_research_assistant(query)
+                    elif func_name == "call_web_search_assistant":
+                        url = arguments.get("url", "")
+                        wait_for = arguments.get("wait_for", 0)
+                        result = call_web_search_assistant(url, wait_for)
+                    elif func_name == "call_research_professional":
+                        subprompt = arguments.get("prompt", "")
+                        result = call_research_professional(question, subprompt)
+                    elif func_name == "call_helper":
+                        subprompt = arguments.get("prompt", "")
+                        result = call_helper(subprompt)
+                    else:
+                        result = f"Tool {func_name} is not implemented."
+
+                    # Feed function result back as tool role
+                    tool_result_message = {
+                        "role": "tool",
+                        "content": result,
+                        "tool_call_id": tc.id,
+                    }
+                    messages.append(msg)  # Add assistant's request
+                    messages.append(tool_result_message)
+
+            elif finish_reason == "stop":
+                # If refactor_count is less than 5, provide critical feedback
+                if refactor_count < 5:
+                    refactor_count += 1
+                    messages.append({
+                        "role": "developer",
+                        "content": get_critical_feedback(question, assistant_content),
+                    })                 
+                elif refactor_count == 5:
+                    refactor_count += 1
+                    messages.append({
+                        "role": "developer",
+                        "content": "provide your final answer as if writing it for the first time",
+                    }) 
+                else:
+                    # Final assistant answer handling
+                    if assistant_content:
+                        print("\nAssistant:\n" + assistant_content)
+                        return assistant_content
+                    else:
+                        print("\nAssistant provided no content.")
+                    break
+
+            elif finish_reason == "length":
+                # Handling response cut-off due to length
+                print("The model's response got cut off. Stopping...")
+                break
+
+            elif finish_reason == "tool_calls":
+                # Continue loop to handle generating function calls
+                pass
+            else:
+                # Handle any unexpected finish reasons
+                if assistant_content:
+                    print("\nAssistant (final):\n" + assistant_content)
+                else:
+                    print("\nAssistant provided no content.")
+                break
+        except Exception as e:
+            return f"Error calling OpenAI model='o1': {str(e)}"
+    return ""
+
+def call_helper(prompt: str) -> str:
+    """
+    Interfaces with OpenAI's "gpt-4o" model for complex reasoning tasks.
+    Provides support for advanced queries and intermediate task solving.
+    """
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        # Return as JSON for clarity
-        return json.dumps(data, indent=2)
-    except Exception as e:
-        return f"Error calling Firecrawl Search API: {str(e)}"
-
-
-def call_openai_o1(prompt: str) -> str:
-    """
-    Calls OpenAI with model='o1' to handle more advanced reasoning or sub-queries.
-    """
-    try:
-        sub_response = openai.ChatCompletion.create(
-            model="o1",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return sub_response.choices[0].message["content"]
-    except Exception as e:
-        return f"Error calling OpenAI model='o1': {str(e)}"
-
-
-def call_openai_gpt4o(prompt: str) -> str:
-    """
-    Calls OpenAI with model='gpt-4o' for advanced GPT-4 style reasoning or sub-queries.
-    """
-    try:
-        sub_response = openai.ChatCompletion.create(
+        completion = openai.chat.completions.create(
             model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": get_current_datetime() + '\n' + prompt}],
+            temperature=0.9,
+            max_completion_tokens=1600
         )
-        return sub_response.choices[0].message["content"]
+
+        return completion.choices[0].message.content
     except Exception as e:
         return f"Error calling OpenAI model='gpt-4o': {str(e)}"
 
-
 ################################################################################
-# 3) Define the JSON schema for each function (tool).
-#    We provide these definitions to the main ChatCompletion endpoint so the model
-#    can choose to call them if it decides they are relevant.
+# 3) Define JSON schema for each function (tool).
+#    These definitions are provided to ChatCompletion to enable the model to choose
+#    appropriate functions to call.
 ################################################################################
 
 tools = [
     {
         "type": "function",
         "function": {
-            "name": "call_perplexity",
+            "name": "call_research_assistant",
             "description": (
-                "Use this to do a broader web-based query via Perplexity. Provide a 'query' "
-                "that you want to research or get an answer for."
+                "Allows the model to request assistance from a virtual research assistant. "
+                "Provide detailed information for conducting research on one topic at a time."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "A question or search query to be sent to Perplexity",
+                        "description": "Query or question for the research assistant",
                     }
                 },
                 "required": ["query"],
@@ -178,10 +262,10 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "call_firecrawl_scrape",
+            "name": "call_web_search_assistant",
             "description": (
-                "Use this to scrape a single webpage with Firecrawl. Provide the full URL and an "
-                "optional wait time in ms."
+                "Uses a virtual research assistant to perform web URL research. "
+                "Provide a URL to extract content and generate a markdown report."
             ),
             "parameters": {
                 "type": "object",
@@ -189,7 +273,7 @@ tools = [
                     "url": {"type": "string", "description": "Full URL to scrape"},
                     "wait_for": {
                         "type": "number",
-                        "description": "Wait in ms before scraping (0 by default)."
+                        "description": "Milliseconds to wait before scraping (default 0)",
                     },
                 },
                 "required": ["url"],
@@ -200,42 +284,17 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "call_firecrawl_search",
+            "name": "call_research_professional",
             "description": (
-                "Use this to search the web (SERP) with Firecrawl. Provide a 'query' and optionally "
-                "a 'limit' for the number of results. Returns JSON data."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "A search query, e.g. 'best pizza in NYC'"
-                    },
-                    "limit": {
-                        "type": "number",
-                        "description": "Max number of results to retrieve; default=5."
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "call_openai_o1",
-            "description": (
-                "Use this if you want to sub-question a more advanced reasoning model named 'o1'. "
-                "Provide a 'prompt' that you want to analyze with model='o1'."
+                "Calls a professional external researcher for in-depth analysis. "
+                "Provide a detailed prompt for tackling sophisticated inquiries."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "A prompt or question to the 'o1' model"
+                        "description": "Search inquiry, e.g., 'best pizza in NYC'",
                     }
                 },
                 "required": ["prompt"],
@@ -246,17 +305,17 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "call_openai_gpt4o",
+            "name": "call_helper",
             "description": (
-                "Use this if you want to sub-question a GPT-4 style advanced model called 'gpt-4o'. "
-                "Provide a 'prompt' that you want to analyze with this model."
+                "Uses an assistant to support tasks that do not involve research directly, "
+                "assisting with intermediate question parsing and logical tasks."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "A prompt or question to the 'gpt-4o' model"
+                        "description": "Prompt or question for assistant support",
                     }
                 },
                 "required": ["prompt"],
@@ -269,121 +328,72 @@ tools = [
 ################################################################################
 # 4) Main conversation loop
 #
-#    The user asks a question. We pass the conversation (including function defs)
-#    to the "o1" model. If the model decides a function call is appropriate, we
-#    detect it, run the function, feed results back, letting the model produce an
-#    informed final answer. 
+#    Processes user inquiries by utilizing OpenAI's "o1" model to evaluate the
+#    necessity of function calls. Executes functions and iteratively supplies
+#    feedback until receiving a conclusive answer.
 #
 ################################################################################
 
 def main():
-    print("Welcome! Ask any question. The system will use model='o1' to answer.")
-    user_question = input("User: ").strip()
+    # Attempt to read user question from a file
+    try:
+        with open('o1wtools-input.txt', 'r') as input_file:
+            user_question = input_file.read()
+            print("File has been successfully read.")
+    except FileNotFoundError:
+        print("The file 'input.txt' does not exist.")
+    except IOError:
+        print("An error occurred while reading the file.")
 
-    # Start conversation with system + user messages
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an advanced assistant using model='o1'. You can call the following functions if needed "
-                "to gather additional information or handle sub-queries. Think carefully about when to call them. "
-                "When you have enough info, produce the best possible final answer for the user."
-            ),
-        },
-        {
-            "role": "user",
-            "content": user_question,
-        },
-    ]
+    # Conduct research based on user's question
+    final_answer = call_research_professional(user_question, user_question)
 
-    # We'll do up to a few iterations. The assistant can request function calls.
-    for _ in range(5):
-        response = openai.ChatCompletion.create(
-            model="o1",
-            messages=messages,
-            tools=tools,
-        )
-
-        msg = response.choices[0].message
-        finish_reason = response.choices[0].finish_reason
-        tool_calls = msg.get("tool_calls")
-        assistant_content = msg.get("content")
-
-        if tool_calls:
-            # The model is requesting one or more function calls
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                arguments_json = tc["function"]["arguments"]
-
-                # Attempt to parse the function arguments:
-                try:
-                    arguments = json.loads(arguments_json)
-                except json.JSONDecodeError:
-                    arguments = {}
-
-                # Execute the matching function:
-                if func_name == "call_perplexity":
-                    query = arguments.get("query", "")
-                    result = call_perplexity(query)
-
-                elif func_name == "call_firecrawl_scrape":
-                    url = arguments.get("url", "")
-                    wait_for = arguments.get("wait_for", 0)
-                    result = call_firecrawl_scrape(url, wait_for)
-
-                elif func_name == "call_firecrawl_search":
-                    query = arguments.get("query", "")
-                    limit = arguments.get("limit", 5)
-                    result = call_firecrawl_search(query, limit)
-
-                elif func_name == "call_openai_o1":
-                    subprompt = arguments.get("prompt", "")
-                    result = call_openai_o1(subprompt)
-
-                elif func_name == "call_openai_gpt4o":
-                    subprompt = arguments.get("prompt", "")
-                    result = call_openai_gpt4o(subprompt)
-
-                else:
-                    result = f"Tool {func_name} is not implemented."
-
-                # Now feed the result back as a "tool" role
-                tool_result_message = {
-                    "role": "tool",
-                    "content": result,
-                    "tool_call_id": tc["id"],
-                }
-                messages.append(msg)  # The assistant's request
-                messages.append(tool_result_message)
-
-        elif finish_reason == "stop":
-            # The model gave a final answer
-            if assistant_content:
-                print("\nAssistant:\n" + assistant_content)
-            else:
-                print("\nAssistant provided no content.")
-            break
-
-        elif finish_reason == "length":
-            # The conversation got cut off or is too long
-            print("The model's response got cut off. Stopping...")
-            break
-
-        elif finish_reason == "tool_calls":
-            # The model ended after generating function calls. Continue in loop 
-            # so we can feed back the tool results as messages.
-            pass
-
-        else:
-            # Possibly an unrecognized reason
-            if assistant_content:
-                print("\nAssistant (final):\n" + assistant_content)
-            else:
-                print("\nAssistant provided no content.")
-            break
+    # Write conclusion to a file
+    try:
+        with open('o1wtools-ouput.txt', 'w') as output_file:
+            output_file.write(final_answer)
+            print("Content written successfully to 'output.txt'.")
+    except IOError:
+        print("An error occurred while writing to the file.")
 
     print("\n--- End of conversation ---")
 
+class TestFunctions:
+    """
+    A suite of tests interacting with real APIs.
+    Ensure tokens are valid and be aware of potential usage on credits.
+    """
+
+    def test_call_research_assistant(self):
+        # Perform a basic query via Perplexity
+        result = call_research_assistant("What is the capital of France?")
+        # Verify there are no error messages
+        assert "Error " not in result, f"Failed Perplexity call: {result}"
+        # Check non-emptiness for content relevance
+        assert len(result.strip()) > 0, "Perplexity returned no content."
+
+    def test_call_web_search_assistant(self):
+        # Attempt to scrape a specified URL
+        result = call_web_search_assistant("http://www.chrisclark.com", 0)
+        assert "Error " not in result, f"Failed Firecrawl scrape: {result}"
+        # Ensure returned content is non-empty
+        assert len(result.strip()) > 0, "Firecrawl returned no content."
+
+    def test_call_research_professional(self):
+        # Queries the 'o1' model for a simple prompt
+        prompt = "Give me a short greeting in Spanish."
+        result = call_research_professional(prompt, prompt)
+        assert "Error " not in result, f"Failed openai o1 call: {result}"
+        # Validate response non-emptiness
+        assert len(result.strip()) > 0, "Empty response from o1."
+
+    def test_call_helper(self):
+        # Queries the 'gpt-4o' model for assistance
+        prompt = "Explain quantum computing in one sentence."
+        result = call_helper(prompt)
+        assert "Error " not in result, f"Failed openai gpt-4o call: {result}"
+        # Confirm helper provides substantial output
+        assert len(result.strip()) > 0, "Empty response from gpt-4o."
 
 if __name__ == "__main__":
     main()
