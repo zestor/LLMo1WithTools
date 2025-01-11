@@ -12,10 +12,9 @@ import requests
 ################################################################################
 
 # For illustration only; in a production system, store tokens securely (e.g., environment variables or vault).
-PERPLEXITY_API_TOKEN = "<your_perplexity_token>"
-FIRECRAWL_API_TOKEN = "<your_firecrawl_token>"
-
-openai.api_key = os.getenv("OPENAI_API_KEY", "sk-...")
+PERPLEXITY_API_TOKEN = os.getenv("PERPLEXITY_API_TOKEN", "...")
+FIRECRAWL_API_TOKEN = os.getenv("FIRECRAWL_API_TOKEN", "...")
+openai.api_key = os.getenv("OPENAI_API_KEY", "...")
 
 ################################################################################
 # 2) Define Python functions that call external APIs
