@@ -444,7 +444,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         ]
 
     # Main loop for back-and-forth with the model
-    for _ in range(500):
+    for _ in range(20):
         # For debugging/logging
         print("~" * 80)
         print("\nMessage Stack Before:\n")
