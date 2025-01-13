@@ -9,6 +9,8 @@ from typing import List, Dict, Any, Optional
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from firecrawl import FirecrawlApp
+
 
 lock = threading.Lock()
 
@@ -23,7 +25,7 @@ def get_current_datetime() -> str:
     formatted_time = now.strftime("%A, %B %d, %Y, %H:%M:%S")
     return f"Current date and time:{formatted_time}"
 
-def call_research_assistant(query: str) -> str:
+def _call_research_assistant(query: str) -> str:
 
     response1 = _call_research_assistant("find official, " + query, "month")
     print("Program will wait for 2 seconds.")
@@ -47,7 +49,7 @@ Write your best response to the question based on this independent research.
 """
     return call_helper(prompt)
 
-def _call_research_assistant(query: str, recency: str = "month") -> str:
+def call_research_assistant(query: str, recency: str = "month") -> str:
     """
     Calls the Perplexity AI API with the given query.
     Returns the text content from the model’s answer.
@@ -68,7 +70,7 @@ def _call_research_assistant(query: str, recency: str = "month") -> str:
         "Content-Type": "application/json",
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
         response.raise_for_status()
         data = response.json()
         retval = data["choices"][0]["message"]["content"]
@@ -87,36 +89,14 @@ def _call_research_assistant(query: str, recency: str = "month") -> str:
         return f"Error calling Perplexity API: {str(e)}"
 
 
-def call_web_search_assistant(url: str, wait_for: int = 0) -> str:
-    """
-    Calls Firecrawl's /v1/scrape endpoint to scrape a single URL.
-    Returns the resulting markdown content if successful.
-    """
-    endpoint = "https://api.firecrawl.dev/v1/scrape"
-    payload = {
-        "url": url,
-        "formats": ["markdown"],
-        "onlyMainContent": True,
-        "waitFor": wait_for,
-        "location": {"country": "US", "languages": ["en"]},
-        "removeBase64Images": True,
-    }
-    headers = {
-        "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+def call_web_search_assistant(url: str) -> str:
+    retval = ""
     try:
-        response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("success"):
-            return data["data"].get("markdown", "No markdown content was returned.")
-        else:
-            return f"Firecrawl error: {data.get('warning', 'Unknown error')}"
+        app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
+        retval = app.scrape_url(url, params={'formats': ['markdown', 'html']})
     except Exception as e:
-        return f"Error calling Firecrawl API: {str(e)}"
+        retval = f"Error returning markdown data from {url}: {str(e)}"
+    return retval
 
 
 def get_critical_feedback(question: str, assistant_content: str) -> str:
@@ -134,13 +114,18 @@ def get_critical_feedback(question: str, assistant_content: str) -> str:
     ```
     """)
     response = f"""
-Optimize your response to the objective by focusing on addressing the concerns. I would encourage you to use your tools.
+Optimize your response to the objective by focusing on addressing the critical feedback. 
+I would encourage your to use your tools. 
+Multiple tool calls in a single request are supported.
+The tools have no context regarding our prior conversation, you must provide the tool all the details including context.
     
-# Objective
+```Objective
 {question}
+```
     
-# Critical feedback
+```Critical feedback
 {critical_feedback}
+```
     """
     print(f"{response}\n\n")
     return response
@@ -200,16 +185,16 @@ tools = [
             "name": "call_research_assistant",
             "description": (
                 "Use this to utilize a PhD grad student to perform research, "
-                "provide them with all details of what to search for, "
-                "they can only research one topic at a time, "
-                "provide all details they have no prior knowledge or context to your query. "
+                "they can only research one single intent question at a time, "
+                "they have no context or prior knowledge of this conversation, "
+                "you must give them the context and a single intention query. "
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "A question or search query to be sent to research assistant",
+                        "description": "A straight to the point concise succint question or search query to be sent to research assistant",
                     }
                 },
                 "required": ["query"],
@@ -230,18 +215,14 @@ tools = [
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to scrape"},
-                    "wait_for": {
-                        "type": "number",
-                        "description": "Wait in ms before scraping (0 by default)."
-                    },
                 },
                 "required": ["url"],
                 "additionalProperties": False,
             },
         },
     },
-
 ]
+
 """
     {
         "type": "function",
@@ -438,6 +419,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # For o1-mini, include a system message giving instructions on how to produce JSON tool calls
         system_message = (
             "You are a helpful AI that can use the following tools by producing JSON in your message. "
+            "To call multiple tools, output multiple JSON blocks (in triple backticks, with a line ```json) in a single response."
             "When you want to call a tool, output EXACTLY a JSON block (in triple backticks, with a line ```json) "
             "of the form:\n\n"
             "{\n"
@@ -648,7 +630,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # If no tool calls, check finish_reason
         if finish_reason == "stop":
 
-            if refactor_count <= 3:
+            if refactor_count <= 1:
 
                 refactor_count = refactor_count + 1
 
@@ -657,7 +639,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
 
                 continue
 
-            elif refactor_count == 4:
+            elif refactor_count == 2:
 
                 refactor_count = refactor_count + 1
 
@@ -671,6 +653,9 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
                         output_file.write("\n")
                 except IOError:
                     print("An error occurred while writing to the file.") 
+
+                continue 
+
             else:
                 # The model gave a final answer
                 if assistant_content:
