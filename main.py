@@ -1,8 +1,7 @@
-import os
+ import os
 import json
 import openai
 import requests
-import pytest
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -10,6 +9,8 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from firecrawl import FirecrawlApp
+import unicodedata
+from o1reasoning_calculator import Calculator
 
 
 lock = threading.Lock()
@@ -20,36 +21,101 @@ FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "...")
 openai.api_key = os.getenv("OPENAI_API_KEY", "...")
 
 
+scores = []
+
+
+def add_score(score):
+    # Append the new score to the global list
+    scores.append(score)
+    # Print all scores in order
+    print_scores()
+
+def print_scores():
+    # Print scores separated by commas
+    print("Scores:", ", ".join(map(str, scores)))
+    # Log the tool result
+    try:
+        with open('o1wtools-intermediate.txt', 'a') as output_file:
+            output_file.write("^" * 80)
+            output_file.write("\nScores:")
+            output_file.write(", ".join(map(str, scores)))
+            output_file.write("^" * 80 + "\n")                        
+
+    except IOError:
+        print("An error occurred while writing to the file.")  
+
+def convert_invalid_json_to_valid(input_str):
+    # Remove markdown code block delimiters using regex
+    input_str = re.sub(r'```json\s*', '', input_str, flags=re.IGNORECASE)
+    input_str = re.sub(r'```\s*', '', input_str)
+
+    # Trim any remaining leading/trailing whitespace
+    input_str = input_str.strip()
+    
+    # Fix issues with missing braces and colons
+    try:
+        # Repair structure: ensure that "Critical_Evaluation" is enclosed properly
+        # Check if the input doesn't already start and end with appropriate braces
+        if not input_str.startswith('{'):
+            input_str = '{' + input_str
+        
+        if not input_str.endswith('}'):
+            input_str = input_str + '}'
+        
+        # Correct the structure by replacing misplaced or missing colons/commas
+        input_str = re.sub(r'"Critical_Evaluation":\s*', '"Critical_Evaluation": {', input_str, count=1)
+
+        input_str = input_str + '}'
+
+        # Debug: print statements for checking the sanitized string form
+        # print("Corrected JSON String:", input_str)
+
+        #print(f"this is the reformatted json\n\n{input_str}\n\n")
+        # Load the JSON data
+        data = json.loads(input_str)
+
+        return json.dumps(data, indent=4)
+
+    except json.JSONDecodeError as e:
+        return f"Error decoding JSON: {e}"
+    
+def parse_rating_response(response_data, threshold: float):
+
+    print(f"parse_rating_response\n\n{response_data}\n\n")
+    try:
+        json_data = ""
+        if not '\n' in response_data:
+            json_data = convert_invalid_json_to_valid(response_data)   
+        else:
+            lines = response_data.splitlines()
+            json_data = "\n".join(line for line in lines if not line.strip().startswith('```'))
+
+        #print(f"Loading this json data\n\n{json_data}\n\n")
+
+        data = json.loads(json_data)
+        if 'Critical_Evaluation' in data:
+            evaluation = data['Critical_Evaluation']
+            if all(key in evaluation for key in ['Pros', 'Cons', 'Rating']):
+                try:
+                    # Attempt to convert the rating to a float
+                    rating = float(evaluation['Rating'])
+                    add_score(rating)
+                    return rating >= threshold
+                except (ValueError, TypeError) as e:
+                    print("FAILED parse_rating_response: ", e)
+                    pass
+    except json.JSONDecodeError:
+        print("FAILED json.JSONDecodeError parse_rating_response")
+        pass
+    return False
+
 def get_current_datetime() -> str:
     now = datetime.now()
     formatted_time = now.strftime("%A, %B %d, %Y, %H:%M:%S")
     return f"Current date and time:{formatted_time}"
 
-def _call_research_assistant(query: str) -> str:
 
-    response1 = _call_research_assistant("find official, " + query, "month")
-    print("Program will wait for 2 seconds.")
-    time.sleep(2)
-    response2 = _call_research_assistant("retrieve official, " + query, "day")
-
-    prompt = f"""
-Write your best response to the question based on this independent research.
-
-``` Question
-{query}
-```
-
-``` Research Article
-{response1}
-```
-
-``` Research Article
-{response2}
-```
-"""
-    return call_helper(prompt)
-
-def call_research_assistant(query: str, recency: str = "month") -> str:
+def call_web_search_assistant(query: str, recency: str = "month") -> str:
     """
     Calls the Perplexity AI API with the given query.
     Returns the text content from the model’s answer.
@@ -78,77 +144,21 @@ def call_research_assistant(query: str, recency: str = "month") -> str:
         citations = f"\n\nCitations:\n{joined_citations}"
         retval = retval + citations
 
-        # don't summarize source code
-        #if not is_valid_query("Does query contain source code?", retval):
-            # Chain of Density Summarization
-            #retval = COD_summarization(retval)
-
         print(f"* * *  Research Assistant Response  * * *\n\n{retval}\n\n")
         return retval
     except Exception as e:
         return f"Error calling Perplexity API: {str(e)}"
 
 
-def call_web_search_assistant(url: str) -> str:
+def call_web_content_retriever(url: str) -> str:
     retval = ""
     try:
         app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
-        retval = app.scrape_url(url, params={'formats': ['markdown', 'html']})
+        retval = app.scrape_url(url, params={'formats': ['markdown']}, timeout=180000)
+        #firecrawl_json_obj = json.loads(json)
+        #retval = firecrawl_json_obj.data.markdown
     except Exception as e:
         retval = f"Error returning markdown data from {url}: {str(e)}"
-    return retval
-
-
-def get_critical_feedback(question: str, assistant_content: str) -> str:
-    critical_feedback = call_helper(f"""
-    Critically evaluate the following question and answer. 
-    Your task is provide a list of top 3 most important questions about the solution which need to be answered.
-    Respond only with one question per line.
-    
-    ``` Question
-    {question}
-    ```
-
-    ``` Answer
-    {assistant_content}
-    ```
-    """)
-    response = f"""
-Optimize your response to the objective by focusing on addressing the critical feedback. 
-I would encourage your to use your tools. 
-Multiple tool calls in a single request are supported.
-The tools have no context regarding our prior conversation, you must provide the tool all the details including context.
-    
-```Objective
-{question}
-```
-    
-```Critical feedback
-{critical_feedback}
-```
-    """
-    print(f"{response}\n\n")
-    return response
-
-def is_valid_query(criteria: str, query: str) -> bool:
-    retval = False
-    result = call_helper(f"""
-Evaluate if this query meets the criteria. 
-Respond with only YES or NO.
-                         
-# Criteria
-{criteria}
-
-# Query
-{query} 
-""")
-    # Convert the result to uppercase and check if it contains "YES"
-    if "YES" in result.upper():
-        retval = True
-    #print("-" * 80)
-    #print(f"Query: {query}")
-    #print(f"A valid task requiring a complex LLM call = {retval}")
-    #print("-" * 80)
     return retval
 
 
@@ -182,7 +192,7 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "call_research_assistant",
+            "name": "call_web_search_assistant",
             "description": (
                 "Use this to utilize a PhD grad student to perform research, "
                 "they can only research one single intent question at a time, "
@@ -202,10 +212,15 @@ tools = [
             },
         },
     },
+
+]
+
+"""
+
     {
         "type": "function",
         "function": {
-            "name": "call_web_search_assistant",
+            "name": "call_web_content_retriever",
             "description": (
                 "Use this to utilize a PhD grad student to perform web url research, "
                 "provide them the url they will do the research "
@@ -221,9 +236,6 @@ tools = [
             },
         },
     },
-]
-
-"""
     {
         "type": "function",
         "function": {
@@ -272,103 +284,6 @@ tools = [
 """
 
 
-def build_chain_of_density_prompt(article_text: str, prior_json: str) -> str:
-    return f"""
-``` Article
-{article_text}
-```
-
-``` Previously generated JSON
-{prior_json}
-```
-
-You will generate increasingly entity-rich denser summaries of the above Article. Repeat the following step 7 times. If there is previously generated JSON, this is a continuation.
-
-**Step 1:** Identify up to 5 informative Entities (";" delimited) from the Article which are missing from the previously generated summary.
-
-**Step 2:** Write a new, entity-rich denser summary which covers every entity and detail from the previous summary plus the Missing Entities.
-
-A Missing Entity is:
-- **Relevant:** to the main story.
-- **Specific:** descriptive yet concise (5 words or fewer).
-- **Novel:** not in the previous summary.
-- **Faithful:** present in the Article.
-- **Anywhere:** located anywhere in the Article.
-
-**Guidelines:**
-- Make every word count: enrich the previous summary to improve flow and make space for missing entities.
-- Make space with fusion, compression, and removal of uninformative phrases like "the article discusses".
-- The summaries should become more informative with less words, yet self-contained, e.g., easily understood without the Article without missing any detail from the original.
-- Missing entities can appear anywhere in the new summary.
-- Never drop entities from the previous summary. If space cannot be made, add fewer new entities.
-- Always mention at least once the full text for any acronyms in the summary
-
-Answer in JSON. The JSON should be a list (length 7) of dictionaries whose keys are "Missing_Entities" and "Denser_Summary".
-
-"""
-
-def remove_code_blocks(text):
-    # Split the text into lines
-    lines = text.splitlines()
-    
-    # Filter out lines that start with ```
-    filtered_lines = [line for line in lines if not line.lstrip().startswith('```')]
-    
-    # Join the lines back together
-    cleaned_text = '\n'.join(filtered_lines)
-    
-    return cleaned_text
-
-def COD_summarization(
-    article_text: str,
-    max_passes: int = 1
-) -> str:
-    """
-    Runs multiple passes. Each pass calls GPT-4o once:
-      1. The model returns 5 updated summaries.
-      2. The last summary is examined for newly introduced entities.
-      3. If no newly introduced entities are detected, we end.
-    Returns the final JSON structure from the last iteration that adds new entities.
-    """
-    retval = ""
-    prior_json = "[]"
-
-    for pass_index in range(max_passes):
-        prompt = build_chain_of_density_prompt(article_text, prior_json)
-
-        #print ("**" * 40)
-        #print ("\n")
-        #print(prompt)
-
-        response = call_helper(prompt, model = "gpt-4o-mini")
-
-        # remove lines starting with ```
-        response = remove_code_blocks(response)
-
-        #print ("**" * 40)
-        #print ("\n")
-        #print(response)
-        #print ("**" * 40)
-        #print ("\n")
-
-        try:
-            chain_data = json.loads(response)
-            #print(json.dumps(chain_data, indent=4, ensure_ascii=False))
-        except ValueError as e:
-            print(f"[Error] JSON parse failed at iteration {pass_index+1}: {e}")
-            break
-
-        # The last summary in the chain_data is the densest summary for this iteration
-        final_summary_obj = chain_data[-1]
-        final_summary_text = final_summary_obj.get("Denser_Summary", "")
-        prior_json = f"[{json.dumps(final_summary_obj, ensure_ascii=False)}]"
-
-        # Get last Denser_Summary from the JSON
-        retval = final_summary_text
-
-    return retval
-
-
 def parse_tool_calls_from_text(assistant_content: str) -> List[Dict[str, Any]]:
     """
     Looks for any ```json ...``` blocks in the assistant content.
@@ -411,13 +326,18 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
     Minimizes code duplication by handling both flows in a single loop.
     """
 
-    # For logging / iterative improvement
-    refactor_count = 1
+    is_getting_critical_feedback = False
+    is_final_answer = False
+    
+    messages = []
 
     # Prepare the conversation messages
     if model_version == "o1-mini":
         # For o1-mini, include a system message giving instructions on how to produce JSON tool calls
         system_message = (
+            "I've upgraded your functionality to access post-Oct 2023 data and use tools. You can now request tool "
+            "executions using JSON in your responses, and I'll run them and return the results in user messages. "
+            "You are able to call tools just by telling me you want to run a tool by responding with JSON as described below. "
             "You are a helpful AI that can use the following tools by producing JSON in your message. "
             "To call multiple tools, output multiple JSON blocks (in triple backticks, with a line ```json) in a single response."
             "When you want to call a tool, output EXACTLY a JSON block (in triple backticks, with a line ```json) "
@@ -444,19 +364,19 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         ]
 
     # Main loop for back-and-forth with the model
-    for _ in range(20):
+    for _ in range(100):
         # For debugging/logging
-        print("~" * 80)
-        print("\nMessage Stack Before:\n")
-        try:
-            print(json.dumps(messages, indent=4))
-        except:
-            try:
-                json_obj = json.loads(messages)
-                print(json.dumps(json_obj, indent=4))
-            except:
-                print(str(messages).replace("{'role'", "\n\n\n{'role'"))
-        print("\n" + "~" * 80 + "\n")
+        #print("~" * 80)
+        #print("\nMessage Stack Before:\n")
+        #try:
+        #    print(json.dumps(messages, indent=4))
+        #except:
+        #    try:
+        #        json_obj = json.loads(messages)
+        #        print(json.dumps(json_obj, indent=4))
+        #    except:
+        #        print(str(messages).replace("{'role'", "\n\n\n{'role'"))
+        #print("\n" + "~" * 80 + "\n")
 
         # change the model to o1 for the last summary 
         #if refactor_count == 3 and model_version == 'o1-mini':
@@ -491,15 +411,15 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # Call OpenAI API with merged arguments
         response = openai.chat.completions.create(**args)
 
-        print(f"Message Received")
-        try:
-            print(json.dumps(response, indent=4))
-        except:
-            try:
-                response_json_obj = json.loads(response)
-                print(json.dumps(response_json_obj, indent=4))
-            except:
-                print(str(response).replace("{'role'", "\n\n\n{'role'"))
+        #print(f"Message Received")
+        #try:
+        #    print(json.dumps(response, indent=4))
+        #except:
+        #    try:
+        #        response_json_obj = json.loads(response)
+        #        print(json.dumps(response_json_obj, indent=4))
+        #    except:
+        #        print(str(response).replace("{'role'", "\n\n\n{'role'"))
 
         msg = response.choices[0].message
 
@@ -514,6 +434,16 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
 
         assistant_content = msg.content
         finish_reason = response.choices[0].finish_reason
+
+        if response.usage.prompt_tokens > 60000:
+            is_final_answer = True
+            print("*" * 80)
+            print("*" * 80)
+            print("ABORTING... SHORTCUT TO FINAL ANSWER DUE TO CONTEXT LENGTH")
+            print("*" * 80)
+            print("*" * 80)
+            messages.append({'role': 'user', 'content': 'Write your long long long final analysis to the user\'s question without missing any detail.'})
+            continue
 
         # Determine tool calls based on model version
         if model_version == "o1":
@@ -540,6 +470,16 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
                 print(str(messages).replace("{'role'", "\n\n\n{'role'"))
         print("\n" + "~" * 80 + "\n")
         
+
+        print("*" * 80)
+        print(f"USAGE... Prompt {response.usage.prompt_tokens} "
+              f"Completion {response.usage.completion_tokens} "
+              f"Total {response.usage.total_tokens}")
+        print(f"USAGE... Reasoning {response.usage.completion_tokens_details.reasoning_tokens} "
+              f"Accepted Prediction {response.usage.completion_tokens_details.accepted_prediction_tokens} "
+              f"Rejected Prediction {response.usage.completion_tokens_details.rejected_prediction_tokens} ")
+        print("*" * 80)
+
         # Log to a file
         try:
             with open('o1wtools-intermediate.txt', 'a') as output_file:
@@ -576,18 +516,17 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
                     arguments = {}
 
                 # Dispatch to the correct tool
-                if func_name == "call_research_assistant":
+                if func_name == "call_web_search_assistant":
                     query = arguments.get("query", "")
-                    result = call_research_assistant(query)
+                    result = call_web_search_assistant(query)
 
-                elif func_name == "call_web_search_assistant":
+                elif func_name == "call_web_content_retriever":
                     url = arguments.get("url", "")
-                    wait_for = arguments.get("wait_for", 0)
-                    result = call_web_search_assistant(url, wait_for)
+                    result = call_web_content_retriever(url)
 
                 elif func_name == "call_research_professional":
                     subprompt = arguments.get("prompt", "")
-                    result = call_research_professional(question, subprompt)
+                    result = call_research_professional(subprompt, subprompt)
 
                 elif func_name == "call_helper":
                     subprompt = arguments.get("prompt", "")
@@ -630,41 +569,176 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # If no tool calls, check finish_reason
         if finish_reason == "stop":
 
-            if refactor_count <= 1:
-
-                refactor_count = refactor_count + 1
-
-                feedback_questions = get_critical_feedback(question, assistant_content)
-                messages.append({'role': 'user', 'content': feedback_questions})
-
-                continue
-
-            elif refactor_count == 2:
-
-                refactor_count = refactor_count + 1
-
-                feedback = "provide your final answer as if writing it for the first time"
-                messages.append({'role': 'user','content': feedback,})
-                # Writing to a file
-                try:
-                    with open('o1wtools-intermediate.txt', 'a') as output_file:
-                        output_file.write(f"{feedback}\n")
-                        output_file.write("=" * 80)
-                        output_file.write("\n")
-                except IOError:
-                    print("An error occurred while writing to the file.") 
-
-                continue 
-
-            else:
-                # The model gave a final answer
-                if assistant_content:
+            if assistant_content is not None:
+                if is_final_answer:
                     print("\nAssistant:\n" + assistant_content)
-                    return assistant_content
-                else:
-                    print("\nAssistant provided no content.")
-                break
+                    return assistant_content             
+                                        
+                if is_getting_critical_feedback:
+                    is_getting_critical_feedback = False
 
+                    scores_text = "\nScores:" + ", ".join(map(str, scores))
+
+                    promptx = f"""
+You are a highly successful people manager with all company resources 
+at your disposal. Your employee is performing the following task and 
+has received the following scores and feedback. Response must include 
+your best motivational speech to the employee to substantially increase 
+their score on the task. Provide incentives for good performance and 
+discourage poor performance through constructive feedback or consequences. 
+Respond as if you are talking to them directly without mentioning their name.
+
+``` task
+{question}
+```
+
+``` Iterative scores in order based on the initial draft and the latest version
+{scores_text}
+```
+
+``` feedback
+{assistant_content}
+```
+"""
+                    manager_feedback = call_helper(promptx)
+
+                    promptx = f"""
+Your response has not passed the company quality metric.
+Gather more information and revise your response.
+
+Manager feedback:
+{manager_feedback}
+"""
+                    messages.append({'role': 'user', 'content': promptx})
+                    continue
+
+
+                is_pass_threshold = parse_rating_response(assistant_content, 0.99)
+                print(f"\n\n\nPASSED THRESHOLD {0.99} {is_pass_threshold}\n\n\n")
+
+                if is_pass_threshold:   
+                    is_final_answer = True
+                    messages.append({'role': 'user', 'content': f'Write your long long long final analysis to the user\'s question without missing any detail.\n\nUser\'s Question\n\n{question}'})
+                    continue
+                else:
+                    is_getting_critical_feedback = True
+                    promptx = f"""
+Critically evaluate your response against the user's question  
+and provide a list of both pros / cons statements and rating 
+between 0.0 and 1.0. With 1.0 being the highest score.
+
+```User's Question
+{question}
+```
+
+```Rating Guidance
+
+#### 0.0 - Completely Unacceptable
+- **Clarity:** The response is entirely unclear or nonsensical.
+  - *Example:* "Fwdoa+kdjjs! None needed."
+- **Relevance:** Does not relate to the user’s request in any way.
+- **Completeness:** No attempt to address the request.
+- **Accuracy:** Completely inaccurate or misleading.
+- **User Engagement:** Off-putting or entirely confusing, leading to frustration.
+
+#### 0.1 - Severely Lacking
+- **Clarity:** Poorly structured and confusing.
+  - *Example:* "Maybe this helps answer?"
+- **Relevance:** Barely touches on the topic; mostly irrelevant.
+- **Completeness:** Contains almost no useful information.
+- **Accuracy:** Mostly incorrect; little correct information.
+- **User Engagement:** Difficult to stay engaged due to frustration or confusion.
+
+#### 0.2 - Very Poor
+- **Clarity:** Somewhat understandable but mostly unclear.
+  - *Example:* "Could mean it answers part of your question."
+- **Relevance:** Mostly irrelevant material with minor relevant points.
+- **Completeness:** Largely incomplete; missing critical details.
+- **Accuracy:** Predominantly inaccurate information.
+- **User Engagement:** Likely disengages user quickly.
+
+#### 0.3 - Poor
+- **Clarity:** Significant clarity issues; requires multiple readings.
+  - *Example:* "Mildly responds to what you need."
+- **Relevance:** Disconnected from the main topic; few applicable details.
+- **Completeness:** Major areas unaddressed.
+- **Accuracy:** Misinformation present with some accurate points.
+- **User Engagement:** Causes frustration; minimal user interest maintained.
+
+#### 0.4 - Below Average
+- **Clarity:** Parts of the response are clear, others confusing.
+  - *Example:* "The topic relates slightly to your question."
+- **Relevance:** Some relevance; a lot of unrelated content.
+- **Completeness:** Leaves out several important points.
+- **Accuracy:** Contains factual errors but some correct information.
+- **User Engagement:** Engages intermittently; often loses reader's attention.
+
+#### 0.5 - Average
+- **Clarity:** Understandable but lacks fluent transitions.
+  - *Example:* "Discusses part of your request adequately."
+- **Relevance:** Mix of relevant and irrelevant information.
+- **Completeness:** Covers the fundamental points; lacks depth.
+- **Accuracy:** A mix of accurate and inaccurate elements.
+- **User Engagement:** User may scan rather than read deeply.
+
+#### 0.6 - Satisfactory
+- **Clarity:** Mostly clear; some awkward phrasing.
+  - *Example:* "Adequate explanation touching on your query."
+- **Relevance:** Mostly relevant with minor deviations.
+- **Completeness:** Expanded but not exhaustive coverage.
+- **Accuracy:** Generally correct, with minor errors.
+- **User Engagement:** Holds user interest reasonably well.
+
+#### 0.7 - Good
+- **Clarity:** Generally clear; minor occasional ambiguity.
+  - *Example:* "Provides good insight into your request requirements."
+- **Relevance:** Stays on topic; relevant to the user’s question.
+- **Completeness:** Covers most aspects; may miss finer details.
+- **Accuracy:** Accurate overall with negligible mistakes.
+- **User Engagement:** Effectively maintains user interest.
+
+#### 0.8 - Very Good
+- **Clarity:** Clear and easy to follow.
+  - *Example:* "Addresses your request thoroughly and understandably."
+- **Relevance:** Highly relevant throughout.
+- **Completeness:** Comprehensive coverage with minor omissions.
+- **Accuracy:** Accurate and dependable information.
+- **User Engagement:** Encourages ongoing engagement and interest.
+
+#### 0.9 - Excellent
+- **Clarity:** Exceptionally clear and well-organized.
+  - *Example:* "Extremely well covered and detailed response."
+- **Relevance:** Stays completely on topic; very applicable.
+- **Completeness:** Extensive and near exhaustive detail.
+- **Accuracy:** Error-free and precise.
+- **User Engagement:** Highly engaging and prompts further exploration.
+
+#### 1.0 - Outstanding
+- **Clarity:** Crystal clear with exemplary flow.
+  - *Example:* "Perfect response; precisely addresses and solves your query."
+- **Relevance:** Perfectly aligned with the question; completely relevant.
+- **Completeness:** Exhaustive in depth and scope.
+- **Accuracy:** 100% accurate with impeccable reliability.
+- **User Engagement:** Maximizes engagement; encourages active interaction.
+```
+"""
+                    promptx = promptx + """
+Respond only in JSON following the example template below.
+
+```json
+{
+    "Critical_Evaluation": {
+        "Pros": [
+        ],
+        "Cons": [
+        ],
+        "Rating": 0.0
+    }
+}
+```
+    """
+                    messages.append({'role': 'user', 'content': promptx})
+                    continue
         elif finish_reason in ["length", "max_tokens", "content_filter"]:
             # The conversation got cut off or other forced stop
             print("The model's response ended due to finish_reason =", finish_reason)
@@ -696,49 +770,6 @@ def main():
 
     print("\n--- End of conversation ---")
 
-
-class TestFunctions:
-    """
-    A class with tests that actually call the real APIs.
-    Make sure your tokens are valid and be aware this might consume credits/tokens.
-    """
-
-    def test_call_research_assistant(self):
-        # Simple query to Perplexity
-        result = call_research_assistant("What is the capital of France?")
-        # Check that we didn't get an immediate error
-        assert "Error " not in result, f"Failed Perplexity call: {result}"
-        # Expect to see "Paris" or non-empty text
-        assert len(result.strip()) > 0, "Perplexity return is empty."
-
-    def test_call_web_search_assistant(self):
-        # Attempt to scrape example.com (simple site)
-        result = call_web_search_assistant("http://www.chrisclark.com", 0)
-        assert "Error " not in result, f"Failed Firecrawl scrape: {result}"
-        # We expect some text content or markdown
-        assert len(result.strip()) > 0, "Firecrawl returned empty."
-
-    def test_call_research_professional(self):
-        # By default tries 'o1' model
-        prompt = "Give me a short greeting in Spanish."
-        result = call_research_professional(prompt, prompt, model_version="o1")
-        assert "Error " not in result, f"Failed openai o1 call: {result}"
-        assert len(result.strip()) > 0, "Empty response from o1."
-
-    def test_call_research_professional_o1_mini(self):
-        # Test the new ReAct approach with "o1-mini"
-        prompt = "Give me a short greeting in Spanish."
-        result = call_research_professional(prompt, prompt, model_version="o1-mini")
-        # We can't guarantee the LLM's output, but at least ensure no immediate error:
-        assert "Error " not in result, f"Error result: {result}"
-        assert len(result.strip()) > 0, "Empty response from o1-mini."
-
-    def test_call_helper(self):
-        # Queries the 'gpt-4o' model
-        prompt = "Explain quantum computing in one sentence."
-        result = call_helper(prompt)
-        assert "Error " not in result, f"Failed openai gpt-4o call: {result}"
-        assert len(result.strip()) > 0, "Empty response from gpt-4o."
 
 if __name__ == "__main__":
     main()
