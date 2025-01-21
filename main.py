@@ -569,17 +569,16 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # If no tool calls, check finish_reason
         if finish_reason == "stop":
 
-            if assistant_content is not None:
-                if is_final_answer:
-                    print("\nAssistant:\n" + assistant_content)
-                    return assistant_content             
-                                        
-                if is_getting_critical_feedback:
-                    is_getting_critical_feedback = False
+            if is_final_answer:
+                print("\nAssistant:\n" + assistant_content)
+                return assistant_content             
+                                    
+            if is_getting_critical_feedback:
+                is_getting_critical_feedback = False
 
-                    scores_text = "\nScores:" + ", ".join(map(str, scores))
+                scores_text = "\nScores:" + ", ".join(map(str, scores))
 
-                    promptx = f"""
+                promptx = f"""
 You are a highly successful people manager with all company resources 
 at your disposal. Your employee is performing the following task and 
 has received the following scores and feedback. Response must include 
@@ -600,29 +599,29 @@ Respond as if you are talking to them directly without mentioning their name.
 {assistant_content}
 ```
 """
-                    manager_feedback = call_helper(promptx)
+                manager_feedback = call_helper(promptx)
 
-                    promptx = f"""
+                promptx = f"""
 Your response has not passed the company quality metric.
 Gather more information and revise your response.
 
 Manager feedback:
 {manager_feedback}
 """
-                    messages.append({'role': 'user', 'content': promptx})
-                    continue
+                messages.append({'role': 'user', 'content': promptx})
+                continue
 
 
-                is_pass_threshold = parse_rating_response(assistant_content, 0.99)
-                print(f"\n\n\nPASSED THRESHOLD {0.99} {is_pass_threshold}\n\n\n")
+            is_pass_threshold = parse_rating_response(assistant_content, 0.99)
+            print(f"\n\n\nPASSED THRESHOLD {0.99} {is_pass_threshold}\n\n\n")
 
-                if is_pass_threshold:   
-                    is_final_answer = True
-                    messages.append({'role': 'user', 'content': f'Write your long long long final analysis to the user\'s question without missing any detail.\n\nUser\'s Question\n\n{question}'})
-                    continue
-                else:
-                    is_getting_critical_feedback = True
-                    promptx = f"""
+            if is_pass_threshold:   
+                is_final_answer = True
+                messages.append({'role': 'user', 'content': f'Write your long long long final analysis to the user\'s question without missing any detail.\n\nUser\'s Question\n\n{question}'})
+                continue
+            else:
+                is_getting_critical_feedback = True
+                promptx = f"""
 Critically evaluate your response against the user's question  
 and provide a list of both pros / cons statements and rating 
 between 0.0 and 1.0. With 1.0 being the highest score.
@@ -722,7 +721,7 @@ between 0.0 and 1.0. With 1.0 being the highest score.
 - **User Engagement:** Maximizes engagement; encourages active interaction.
 ```
 """
-                    promptx = promptx + """
+                promptx = promptx + """
 Respond only in JSON following the example template below.
 
 ```json
@@ -737,8 +736,8 @@ Respond only in JSON following the example template below.
 }
 ```
     """
-                    messages.append({'role': 'user', 'content': promptx})
-                    continue
+                messages.append({'role': 'user', 'content': promptx})
+                continue
         elif finish_reason in ["length", "max_tokens", "content_filter"]:
             # The conversation got cut off or other forced stop
             print("The model's response ended due to finish_reason =", finish_reason)
