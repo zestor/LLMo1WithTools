@@ -1,4 +1,4 @@
- import os
+import os
 import json
 import openai
 import requests
@@ -435,7 +435,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         assistant_content = msg.content
         finish_reason = response.choices[0].finish_reason
 
-        if response.usage.prompt_tokens > 60000:
+        if response.usage.prompt_tokens > 60000 and not is_final_answer:
             is_final_answer = True
             print("*" * 80)
             print("*" * 80)
