@@ -1,6 +1,6 @@
 import os
 import json
-import openai
+from openai import OpenAI
 import requests
 import re
 from datetime import datetime
@@ -18,7 +18,14 @@ lock = threading.Lock()
 # For illustration only; in a production system, store tokens securely (e.g., environment variables or vault).
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "...")
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "...")
-openai.api_key = os.getenv("OPENAI_API_KEY", "...")
+USE_DEEPSEEK = True
+
+if USE_DEEPSEEK:
+    client = OpenAI(base_url="https://api.deepseek.com")
+    client.api_key = os.getenv("DEEPSEEK_API_KEY", "...")
+else:
+    client = OpenAI(base_url="https://api.openai.com")
+    client.api_key = os.getenv("OPENAI_API_KEY", "...")
 
 
 scores = []
@@ -164,9 +171,12 @@ def call_web_content_retriever(url: str) -> str:
 
 def call_helper(prompt: str, model: str = "gpt-4o", messages: Optional[List[Dict[str, str]]] = None) -> str:
     """
-    Calls OpenAI with model='gpt-4o' for advanced GPT-4 style reasoning or sub-queries.
+    Calls LLM for advanced reasoning or sub-queries.
     """
     helper_messages = []
+
+    if USE_DEEPSEEK:
+        model = "deepseek-reasoner"
 
     if messages is None:
         helper_messages = [
@@ -178,14 +188,14 @@ def call_helper(prompt: str, model: str = "gpt-4o", messages: Optional[List[Dict
         helper_messages.append({'role': 'user', 'content': prompt})
     
     try:
-        completion = openai.chat.completions.create(
+        completion = client.chat.completions.create(
             model=model,
             messages=helper_messages
         )
 
         return completion.choices[0].message.content
     except Exception as e:
-        return f"Error calling OpenAI model='{model}': {str(e)}"
+        return f"Error calling LLM model='{model}': {str(e)}"
 
 
 tools = [
@@ -319,12 +329,22 @@ def parse_tool_calls_from_text(assistant_content: str) -> List[Dict[str, Any]]:
             pass
     return tool_calls
 
+# for DeepSeek they don't support multiple messages
+def get_compressed_messages(messages) -> Dict[str,str]:
+    formatted_output = ""
+    for message in messages:
+        role = message.get('role', 'unknown')
+        content = message.get('content', '')
+        formatted_output += f"\n=====\n[{role.upper()}]:\n=====\n{content}\n\n"
+    return [{"role":"user", "content":formatted_output}]
+
 def call_research_professional(question: str, prompt: str, model_version: str = "o1-mini") -> str:
     """
-    Calls either openai model='o1' (with official function calling) or
-    openai model='o1-mini' (ReAct style, parse JSON from text).
-    Minimizes code duplication by handling both flows in a single loop.
+    Calls reasoning LLM o1, o1-mini, deepseek-reasoner
     """
+
+    if USE_DEEPSEEK:
+        model_version = "deepseek-reasoner"
 
     is_getting_critical_feedback = False
     is_final_answer = False
@@ -332,7 +352,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
     messages = []
 
     # Prepare the conversation messages
-    if model_version == "o1-mini":
+    if model_version == "o1-mini" or model_version == "deepseek-reasoner":
         # For o1-mini, include a system message giving instructions on how to produce JSON tool calls
         system_message = (
             "I've upgraded your functionality to access post-Oct 2023 data and use tools. You can now request tool "
@@ -383,24 +403,38 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         #    model_version = "o1"
         #    messages = messages[1:]
 
-        # Call the appropriate model
-        base_args = {
-            "messages": messages,
-            "response_format": {"type": "text"},
-        }
+        if USE_DEEPSEEK:
+            base_args = {
+                "messages": get_compressed_messages(messages),
+                "response_format": {"type": "text"},
+            }
+        else:
+            base_args = {
+                "messages": messages,
+                "response_format": {"type": "text"},
+            }
 
         # Define model-specific settings
         if model_version == "o1":
+            MAX_PROMPT_TOKENS = 60000
             model_args = {
-                "model": "o1",
+                "model": model_version,
                 "tools": tools,
                 "reasoning_effort": "high",
                 "max_completion_tokens": 100000
             }
         elif model_version == "o1-mini":
+            MAX_PROMPT_TOKENS = 60000
             model_args = {
-                "model": "o1-mini",
+                "model": model_version,
                 "max_completion_tokens": 65536
+            }
+        elif model_version == "deepseek-reasoner":
+            MAX_PROMPT_TOKENS = 32000
+            model_args = {
+                "model": model_version,
+                "max_completion_tokens": 8096,
+                "stream": False
             }
         else:
             raise ValueError(f"Unsupported model version: {model_version}")
@@ -408,8 +442,8 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # Merge common and model-specific settings
         args = {**base_args, **model_args}
 
-        # Call OpenAI API with merged arguments
-        response = openai.chat.completions.create(**args)
+        # Call LLM API with merged arguments
+        response = client.chat.completions.create(**args)
 
         #print(f"Message Received")
         #try:
@@ -435,7 +469,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         assistant_content = msg.content
         finish_reason = response.choices[0].finish_reason
 
-        if response.usage.prompt_tokens > 60000 and not is_final_answer:
+        if response.usage.prompt_tokens > MAX_PROMPT_TOKENS and not is_final_answer:
             is_final_answer = True
             print("*" * 80)
             print("*" * 80)
@@ -448,15 +482,11 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
         # Determine tool calls based on model version
         if model_version == "o1":
             tool_calls = getattr(msg, "tool_calls", None)
-        elif model_version == "o1-mini":
-            tool_calls = parse_tool_calls_from_text(assistant_content)
-
-        # Append the assistant's text to the conversation
-        if model_version == "o1":
             messages.append(msg)
-        elif model_version == "o1-mini":
+        else:
+            tool_calls = parse_tool_calls_from_text(assistant_content)
             messages.append({'role':'assistant', 'content':assistant_content})
-
+ 
         # For debugging/logging
         print("~" * 80)
         print("\nMessage Stack After:\n")
@@ -541,7 +571,7 @@ def call_research_professional(question: str, prompt: str, model_version: str = 
 
                 tool_result_message = {'role': tool_role, 'content': result}
 
-                if model_version == "o1-mini":
+                if not model_version == "o1":
                     tool_result_message["tool_response"] = func_name
 
                 # “o1” includes a "tool_call_id"; optional for “o1-mini.” We can unify it:
@@ -605,7 +635,7 @@ Respond as if you are talking to them directly without mentioning their name.
 Your response has not passed the company quality metric.
 Gather more information and revise your response.
 
-Manager feedback:
+Feedback from your Manager:
 {manager_feedback}
 """
                 messages.append({'role': 'user', 'content': promptx})
@@ -632,54 +662,6 @@ between 0.0 and 1.0. With 1.0 being the highest score.
 
 ```Rating Guidance
 
-#### 0.0 - Completely Unacceptable
-- **Clarity:** The response is entirely unclear or nonsensical.
-  - *Example:* "Fwdoa+kdjjs! None needed."
-- **Relevance:** Does not relate to the user’s request in any way.
-- **Completeness:** No attempt to address the request.
-- **Accuracy:** Completely inaccurate or misleading.
-- **User Engagement:** Off-putting or entirely confusing, leading to frustration.
-
-#### 0.1 - Severely Lacking
-- **Clarity:** Poorly structured and confusing.
-  - *Example:* "Maybe this helps answer?"
-- **Relevance:** Barely touches on the topic; mostly irrelevant.
-- **Completeness:** Contains almost no useful information.
-- **Accuracy:** Mostly incorrect; little correct information.
-- **User Engagement:** Difficult to stay engaged due to frustration or confusion.
-
-#### 0.2 - Very Poor
-- **Clarity:** Somewhat understandable but mostly unclear.
-  - *Example:* "Could mean it answers part of your question."
-- **Relevance:** Mostly irrelevant material with minor relevant points.
-- **Completeness:** Largely incomplete; missing critical details.
-- **Accuracy:** Predominantly inaccurate information.
-- **User Engagement:** Likely disengages user quickly.
-
-#### 0.3 - Poor
-- **Clarity:** Significant clarity issues; requires multiple readings.
-  - *Example:* "Mildly responds to what you need."
-- **Relevance:** Disconnected from the main topic; few applicable details.
-- **Completeness:** Major areas unaddressed.
-- **Accuracy:** Misinformation present with some accurate points.
-- **User Engagement:** Causes frustration; minimal user interest maintained.
-
-#### 0.4 - Below Average
-- **Clarity:** Parts of the response are clear, others confusing.
-  - *Example:* "The topic relates slightly to your question."
-- **Relevance:** Some relevance; a lot of unrelated content.
-- **Completeness:** Leaves out several important points.
-- **Accuracy:** Contains factual errors but some correct information.
-- **User Engagement:** Engages intermittently; often loses reader's attention.
-
-#### 0.5 - Average
-- **Clarity:** Understandable but lacks fluent transitions.
-  - *Example:* "Discusses part of your request adequately."
-- **Relevance:** Mix of relevant and irrelevant information.
-- **Completeness:** Covers the fundamental points; lacks depth.
-- **Accuracy:** A mix of accurate and inaccurate elements.
-- **User Engagement:** User may scan rather than read deeply.
-
 #### 0.6 - Satisfactory
 - **Clarity:** Mostly clear; some awkward phrasing.
   - *Example:* "Adequate explanation touching on your query."
@@ -704,21 +686,127 @@ between 0.0 and 1.0. With 1.0 being the highest score.
 - **Accuracy:** Accurate and dependable information.
 - **User Engagement:** Encourages ongoing engagement and interest.
 
-#### 0.9 - Excellent
+#### 0.825 - Very Good Plus
+- **Clarity:** Exceptionally clear with seamless flow.
+- **Relevance:** Maintains high relevance with slight enhancements.
+- **Completeness:** Nearly comprehensive; addresses almost all aspects.
+- **Accuracy:** Highly accurate with minimal errors.
+- **User Engagement:** Very engaging, sustaining interest effortlessly.
+
+#### 0.85 - Excellent
 - **Clarity:** Exceptionally clear and well-organized.
   - *Example:* "Extremely well covered and detailed response."
 - **Relevance:** Stays completely on topic; very applicable.
-- **Completeness:** Extensive and near exhaustive detail.
-- **Accuracy:** Error-free and precise.
+- **Completeness:** Extensive and thorough detail, covering all key points.
+- **Accuracy:** Error-free and precise information.
 - **User Engagement:** Highly engaging and prompts further exploration.
 
+#### 0.875 - Excellent Plus
+- **Clarity:** Impeccably clear with flawless structure.
+- **Relevance:** Perfectly aligned with the user’s intent.
+- **Completeness:** Exhaustive coverage with insightful additions.
+- **Accuracy:** Perfectly accurate with no discernible errors.
+- **User Engagement:** Maximizes engagement; highly compelling and interactive.
+
+#### 0.9 - Outstanding
+- **Clarity:** Crystal clear with exemplary flow and readability.
+  - *Example:* "Perfect response; precisely addresses and solves your query with exceptional clarity."
+- **Relevance:** Perfectly aligned with the question; completely relevant in all aspects.
+- **Completeness:** Exhaustive in depth and scope, leaving no aspect unaddressed.
+- **Accuracy:** 100% accurate with impeccable reliability; all information is correct and verifiable.
+- **User Engagement:** Maximizes engagement; encourages active interaction and sustained interest.
+- **Additional Criteria:**
+  - **Structure:** Logically organized with a coherent progression of ideas.
+  - **Style:** Professional and appropriate tone tailored to the user's needs.
+  - **Insightfulness:** Provides valuable insights or perspectives that enhance understanding.
+
+#### 0.925 - Outstanding Plus
+- **Clarity:** Flawless clarity with masterful organization and presentation.
+- **Relevance:** Seamlessly integrates all aspects of the user's question with precise alignment to their intent.
+- **Completeness:** Comprehensive and insightful, leaving no stone unturned and covering all possible dimensions.
+- **Accuracy:** Impeccable accuracy with authoritative and reliable information supported by credible sources.
+- **User Engagement:** Exceptionally engaging; fosters deep user interaction and maintains high levels of interest throughout.
+- **Additional Criteria:**
+  - **Depth of Analysis:** Demonstrates thorough analysis and critical thinking, providing nuanced explanations.
+  - **Creativity:** Incorporates creative elements or unique approaches that add value to the response.
+  - **Responsiveness:** Anticipates and addresses potential follow-up questions or related concerns effectively.
+
+#### 0.95 - Superior
+- **Clarity:** Perfectly articulated with exceptional readability and precision.
+- **Relevance:** Utterly relevant, addressing every facet of the user's inquiry with exactitude.
+- **Completeness:** Complete and thorough beyond expectations, covering all key and ancillary points comprehensively.
+- **Accuracy:** Absolute accuracy with definitive authority; all statements are verifiable and error-free.
+- **User Engagement:** Highly captivating; inspires user action, fosters deeper exploration, and maintains sustained interest.
+- **Additional Criteria:**
+  - **Depth of Content:** Provides in-depth coverage with rich, detailed information that enhances user understanding.
+  - **Analytical Rigor:** Exhibits strong analytical skills, offering critical evaluations and well-supported conclusions.
+  - **Adaptability:** Tailors responses dynamically to align with the user's knowledge level and specific needs.
+  - **Resourcefulness:** Effectively incorporates relevant examples, analogies, or references that facilitate comprehension.
+
+#### 0.96 - Superior Plus
+- **Clarity:** Impeccable clarity with an elegant narrative structure that facilitates effortless understanding.
+- **Relevance:** Intricately tailored to the user's needs with insightful relevance, ensuring every aspect directly addresses the inquiry.
+- **Completeness:** Unmatched thoroughness, encompassing all possible angles and providing exhaustive information without redundancy.
+- **Accuracy:** Flawlessly accurate with authoritative depth, presenting information that is not only correct but also enriched with expert knowledge.
+- **User Engagement:** Exceptionally engaging; profoundly impactful and memorable, fostering a strong connection with the user.
+- **Additional Criteria:**
+  - **Innovative Thinking:** Introduces innovative concepts or approaches that offer fresh perspectives.
+  - **Comprehensive Integration:** Skillfully integrates multiple relevant topics or ideas seamlessly.
+  - **Exceptional Support:** Provides robust evidence, detailed examples, and comprehensive explanations that substantiate all claims.
+  - **User-Centric Approach:** Demonstrates a deep understanding of the user's context and adapts the response to maximize relevance and utility.
+
+#### 0.97 - Exemplary
+- **Clarity:** Unmatched clarity with a sophisticated and nuanced presentation that ensures complete understanding.
+- **Relevance:** Deeply resonates with the user's intent, enhancing their comprehension and addressing implicit needs.
+- **Completeness:** Comprehensive beyond standard expectations, providing added value through extensive coverage and supplementary information.
+- **Accuracy:** Perfectly accurate with insightful analysis, offering precise and well-supported information.
+- **User Engagement:** Highly engaging; creates a meaningful and lasting impression, encouraging continuous interaction and exploration.
+- **Additional Criteria:**
+  - **Advanced Insight:** Delivers profound insights that significantly enhance the user's perspective.
+  - **Holistic Approach:** Considers and integrates various relevant factors, providing a well-rounded and multifaceted response.
+  - **Expert Tone:** Maintains an authoritative yet approachable tone that instills confidence and trust.
+  - **Proactive Assistance:** Anticipates further user needs and proactively addresses potential questions or areas of interest.
+
+#### 0.98 - Masterful
+- **Clarity:** Flawlessly clear with masterful articulation that conveys complex ideas with ease.
+- **Relevance:** Perfectly aligned and anticipates user needs seamlessly, ensuring every element of the response serves a purpose.
+- **Completeness:** Exhaustive and insightful, offering profound depth and breadth that thoroughly satisfies the user's inquiry.
+- **Accuracy:** Impeccably accurate with authoritative and reliable information, presenting data and facts with impeccable precision.
+- **User Engagement:** Exceptionally engaging; inspires trust and admiration, maintaining user interest through compelling content and presentation.
+- **Additional Criteria:**
+  - **Strategic Depth:** Demonstrates strategic thinking by connecting concepts and providing actionable recommendations.
+  - **Comprehensive Detailing:** Includes comprehensive details that leave no aspect unexplored, enhancing the richness of the response.
+  - **Polished Presentation:** Exhibits a polished and professional presentation that reflects a high level of expertise and dedication.
+  - **Empathetic Understanding:** Shows a deep empathetic understanding of the user's situation, tailoring the response to resonate personally.
+
+#### 0.99 - Near Perfect
+- **Clarity:** Crystal clear with impeccable expression, ensuring absolute understanding without ambiguity.
+- **Relevance:** Precisely tailored to the user's question, leaving no room for ambiguity or misinterpretation.
+- **Completeness:** Virtually exhaustive, covering every conceivable aspect with finesse and thoroughness.
+- **Accuracy:** Absolute precision with no errors; authoritative and reliable, providing information that is both correct and insightful.
+- **User Engagement:** Maximizes engagement; deeply resonates and encourages further exploration and interaction.
+- **Additional Criteria:**
+  - **Exemplary Insight:** Offers exceptional insights that provide significant added value and deepen user understanding.
+  - **Seamless Integration:** Effortlessly integrates diverse elements into a cohesive and harmonious response.
+  - **Innovative Excellence:** Showcases innovative excellence by introducing groundbreaking ideas or methodologies.
+  - **Ultimate User Alignment:** Aligns perfectly with the user's goals and expectations, delivering a response that feels personalized and highly relevant.
+
 #### 1.0 - Outstanding
-- **Clarity:** Crystal clear with exemplary flow.
-  - *Example:* "Perfect response; precisely addresses and solves your query."
-- **Relevance:** Perfectly aligned with the question; completely relevant.
-- **Completeness:** Exhaustive in depth and scope.
-- **Accuracy:** 100% accurate with impeccable reliability.
-- **User Engagement:** Maximizes engagement; encourages active interaction.
+- **Clarity:** Crystal clear with exemplary flow and precision, ensuring the response is effortlessly understandable.
+  - *Example:* "Perfect response; precisely addresses and solves your query with exceptional clarity and coherence."
+- **Relevance:** Perfectly aligned with the question; completely relevant in all aspects and anticipates implicit user needs.
+- **Completeness:** Exhaustive in depth and scope, leaving no aspect unaddressed and providing comprehensive coverage.
+- **Accuracy:** 100% accurate with impeccable reliability; all information is correct, verifiable, and articulated with authority.
+- **User Engagement:** Maximizes engagement; encourages active interaction, sustained interest, and fosters a meaningful connection with the user.
+- **Additional Criteria:**
+  - **Mastery of Subject:** Demonstrates unparalleled expertise and mastery of the subject matter, providing authoritative and insightful content.
+  - **Exceptional Innovation:** Introduces highly innovative concepts or solutions that significantly enhance the response's value.
+  - **Flawless Structure:** Exhibits a flawless and logical structure that enhances the readability and effectiveness of the response.
+  - **Inspirational Quality:** Possesses an inspirational quality that motivates and empowers the user, leaving a lasting positive impression.
+  - **Comprehensive Support:** Provides extensive supporting evidence, detailed examples, and thorough explanations that reinforce all assertions.
+  - **Adaptive Responsiveness:** Adapts dynamically to any nuances in the user's question, ensuring the response is precisely tailored and highly effective.
+  - **Holistic Integration:** Seamlessly integrates multiple perspectives and dimensions, offering a well-rounded and multifaceted answer.
+  - **Empathetic Connection:** Establishes a deep empathetic connection, demonstrating a profound understanding of the user's context and needs.
 ```
 """
                 promptx = promptx + """
